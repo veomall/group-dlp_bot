@@ -1,117 +1,141 @@
+import asyncio
 import logging
 import os
-import asyncio
-import functools
-import html
+import re
+from typing import Tuple
+from uuid import uuid4
+
+import yt_dlp
 from dotenv import load_dotenv
-from telegram import Update, InputFile
+from telegram import Update
+# Импортируем класс ошибки Telegram для более точного отлова
+from telegram.error import TelegramError
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from telegram.constants import MessageEntityType
 
-# Импортируем нашу функцию скачивания
-from downloader import download_video
-
-# Загружаем переменные окружения из файла .env
-load_dotenv()
-
-# Включаем логирование
+# Включаем логирование для отладки
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Токен вашего бота теперь берется из переменных окружения
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# Указываем путь к файлу с cookie
-COOKIES_FILE = "youtube-cookies.txt"
+# Загружаем переменные окружения из .env файла
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("Необходимо указать TELEGRAM_TOKEN в .env файле")
+
+# Папка для временного хранения видео
+DOWNLOAD_DIR = 'downloads'
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Ограничение размера файла в байтах (50 МБ - стандартное ограничение Telegram)
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+# Паттерн для поиска URL в тексте
+URL_PATTERN = r'https?://[^\s]+'
 
 
-async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Скачивает видео по ссылке и отправляет его в чат."""
-    message = update.message
-    if not message or not message.text:
-        return
-
-    # Извлекаем первую ссылку из сообщения
-    url_entities = [e for e in message.entities if e.type in (MessageEntityType.URL, MessageEntityType.TEXT_LINK)]
-    if not url_entities:
-        return  # Не должно произойти из-за фильтров
-
-    entity = url_entities[0]
-    if entity.type == MessageEntityType.URL:
-        url = message.text[entity.offset : entity.offset + entity.length]
-    else:  # TEXT_LINK
-        url = entity.url
-
-    if not url:
-        return
-
-    # Проверяем наличие файла с cookie
-    if not os.path.exists(COOKIES_FILE):
-        await message.reply_text(
-            f"Ошибка: Файл с cookie не найден.\n"
-            f"Убедитесь, что файл '{COOKIES_FILE}' находится в той же папке, что и бот."
-        )
-        return
-
-    status_message = await message.reply_text("Получил ссылку. Начинаю скачивание... ⏳")
+async def download_video(url: str) -> Tuple[str, str] | None:
+    """
+    Скачивает видео по URL с помощью yt-dlp.
+    Возвращает кортеж (путь к файлу, название видео) или None в случае ошибки.
+    """
+    temp_filename = os.path.join(DOWNLOAD_DIR, f"{uuid4()}")
+    
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': f'{temp_filename}.%(ext)s',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'filesize_approx': MAX_FILE_SIZE,
+    }
 
     try:
-        # Запускаем блокирующую функцию скачивания в отдельном потоке
-        loop = asyncio.get_running_loop()
-        download_task = functools.partial(download_video, url=url, cookies_file=COOKIES_FILE)
-        video_path, video_title = await loop.run_in_executor(None, download_task)
+        def ydl_download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                
+                filesize = info.get('filesize') or info.get('filesize_approx')
+                if filesize and filesize > MAX_FILE_SIZE:
+                    logger.warning(f"Файл слишком большой: {filesize / 1024 / 1024:.2f} MB. URL: {url}")
+                    filepath_to_delete = ydl.prepare_filename(info)
+                    if os.path.exists(filepath_to_delete):
+                         os.remove(filepath_to_delete)
+                    return None
+                
+                filepath = ydl.prepare_filename(info)
+                title = info.get('title', 'Видео без названия')
+                return filepath, title
 
-        if video_path and os.path.exists(video_path):
-            await status_message.edit_text("Видео скачано! Отправляю... 🚀")
-            
-            # Экранируем специальные HTML-символы в названии и делаем его жирным
-            escaped_title = html.escape(video_title)
-            caption_html = f"<b>{escaped_title}</b>"
+        result = await asyncio.to_thread(ydl_download)
+        return result
 
-            # Отправляем видео, увеличив тайм-ауты и добавив жирную подпись
-            with open(video_path, 'rb') as video_file:
-                await message.reply_video(
-                    video=video_file, 
-                    caption=caption_html,
-                    parse_mode='HTML', # Указываем, что используем HTML-разметку
-                    supports_streaming=True,
-                    read_timeout=60,
-                    write_timeout=60
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Ошибка скачивания yt-dlp для URL {url}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при скачивании {url}: {e}")
+        return None
+
+
+async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик сообщений, который ищет URL, скачивает видео и отправляет его.
+    """
+    if not update.message or not update.message.text:
+        return
+
+    message_text = update.message.text
+    match = re.search(URL_PATTERN, message_text)
+    
+    if not match:
+        return
+        
+    url = match.group(0)
+    logger.info(f"Обнаружен URL: {url} в чате {update.effective_chat.id}")
+
+    filepath = None
+    try:
+        download_result = await download_video(url)
+        
+        # Сценарий 1: Видео успешно скачано
+        if download_result:
+            filepath, video_title = download_result
+            logger.info(f"Видео '{video_title}' скачано: {filepath}. Попытка отправки...")
+            try:
+                await context.bot.send_video(
+                    chat_id=update.effective_chat.id,
+                    video=open(filepath, 'rb'),
+                    caption=video_title,
+                    reply_to_message_id=update.message.message_id
                 )
-            
-            # Удаляем сообщение о статусе
-            await status_message.delete()
+                logger.info(f"Видео успешно отправлено в чат {update.effective_chat.id}")
+            except TelegramError as e:
+                # Сценарий 2: Ошибка при отправке в Telegram
+                logger.error(f"Ошибка отправки видео в чат {update.effective_chat.id}: {e}")
+                await update.message.reply_text(f"Ошибка: {e}")
+        # Сценарий 3: Ошибка при скачивании (download_result is None)
         else:
-            await status_message.edit_text("Не удалось скачать видео. 😞")
+            logger.info(f"Не удалось обработать URL {url}. Сообщение проигнорировано.")
 
     except Exception as e:
-        logger.error(f"Ошибка при обработке ссылки {url}: {e}", exc_info=True)
-        await status_message.edit_text("Произошла непредвиденная ошибка. 🤯")
+        logger.error(f"Критическая ошибка в обработчике для URL {url}: {e}")
     finally:
-        # Удаляем файл после отправки или в случае ошибки
-        if 'video_path' in locals() and video_path and os.path.exists(video_path):
-            os.remove(video_path)
-            logger.info(f"Удалил временный файл: {video_path}")
+        # В любом случае удаляем временный файл, если он был создан
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+            logger.info(f"Временный файл {filepath} удален.")
 
 
 def main() -> None:
     """Запуск бота."""
-    # Проверяем, что токен был загружен
-    if not TOKEN:
-        logger.critical("Переменная окружения TELEGRAM_BOT_TOKEN не найдена!")
-        logger.critical("Создайте файл .env и добавьте в него строку: TELEGRAM_BOT_TOKEN=ВАШ_ТОКЕН")
-        return
-
     application = Application.builder().token(TOKEN).build()
-
-    # Фильтр для ссылок
-    link_filters = filters.Entity(MessageEntityType.URL) | filters.Entity(MessageEntityType.TEXT_LINK)
-    application.add_handler(MessageHandler(link_filters, link_handler))
-
-    # Запускаем бота
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler))
+    logger.info("Бот запущен...")
     application.run_polling()
 
 
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    main()
